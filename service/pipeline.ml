@@ -39,79 +39,148 @@ let set_active_refs ~repo xs =
 
 let status_sep = String.make 1 Common.status_sep
 
-type job = (string * ([`Built | `Checked] Current.t * Current.job_id option Current.t))
-type pipeline =
-  | Skip
-  | Job of job
-  | Dynamic of pipeline Current.t
-  | Stage of pipeline list
+type job = (string * ([`Built | `Checked] Current_term.Output.t * Current.job_id option))
 
-let job_id ?(kind=`Built) build =
-  let job = Current.map (fun _ -> kind) build in
-  let metadata =
-    let+ md = Current.Analysis.metadata build in
-    match md with
-    | Some { Current.Metadata.job_id; _ } -> job_id
-    | None -> None
-  in
-  (job, metadata)
+let job ~label ~job_id result : job = (label, (result, job_id))
 
+let job_id job =
+  let+ md = Current.Analysis.metadata job in
+  match md with
+  | Some { Current.Metadata.job_id; _ } -> job_id
+  | None -> None
+
+(*
 let once_done x f =
   let+ state = Current.state ~hidden:true x in
   match state with
   | Error _ -> Skip
   | Ok x -> f x
+*)
 
-let build_with_docker ~analysis ~master source =
+module OpamPackage = struct
+  include OpamPackage
+  let pp = Fmt.of_to_string to_string
+end
+
+let list_revdeps ~builder ~image ~pkg =
+  Current.component "list revdeps" |>
+  let> pkg = pkg
+  and> image = image in
+  let args = ["opam";"list";"-s";"--color=never";"--depends-on"; OpamPackage.to_string pkg;"--installable";"--all-versions";"--depopts"] in
+  Builder.pread builder ~args image
+  |> Current.Primitive.map_result (Result.map (fun output ->
+      String.split_on_char '\n' output |>
+      List.filter_map (function
+          | "" -> None
+          | pkg -> Some (OpamPackage.of_string pkg)
+        )
+    ))
+
+let until_ok default x =
+  let+ state = Current.state ~hidden:true x in
+  match state with
+  | Error _ -> default
+  | Ok x -> x
+
+let const c x =
+  x |> Current.map (fun _ -> c) |> Current.state ~hidden:true
+
+let with_label l t =
+  Current.component "%s" l |>
+  let> v = t in
+  Current.Primitive.const v
+
+let build_with_docker ~analysis ~master source : job list Current.t =
   let pipeline =
-    once_done analysis @@ fun analysis ->
-    let pkgs = Analyse.Analysis.packages analysis in
+    let pkgs = Current.map Analyse.Analysis.packages analysis in
     let build ~revdeps label builder variant =
+      let analysis = with_label variant analysis in
       let spec =
         let platform = {Platform.label; builder; variant} in
-        Build.Spec.opam ~label:variant ~platform ~analysis `Build |>
-        Current.return
+        let+ analysis = analysis in
+        Build.Spec.opam ~label:variant ~platform ~analysis `Build
       in
-      List.map (fun pkg ->
-        let prefix = OpamPackage.to_string pkg ^ status_sep ^ label in
-        let image = Build.v ~spec ~schedule:weekly ~revdep:None ~with_tests:false ~pkg ~master source in
-        let tests =
-          once_done image @@ fun _ ->
-          Job (prefix^status_sep^"tests", job_id (Build.v ~spec ~schedule:weekly ~revdep:None ~with_tests:true ~pkg ~master source))
-        in
-        let revdeps =
-          if revdeps then
-            once_done image @@ fun image ->
-            let prefix = prefix^status_sep^"revdeps" in
-            let revdeps_job =
-              Build.pread ~spec image ~args:["opam";"list";"-s";"--color=never";"--depends-on"; OpamPackage.to_string pkg;"--installable";"--all-versions";"--depopts"]
+      let pkgs =
+        (* Add fake dependency from pkgs to spec so that the package begin tested appears
+           below the platform, to make the diagram look nicer. Ideally, the pulls of the
+           base images should be moved to the top (not be per-package at all). *)
+        let+ _ = spec
+        and+ pkgs = pkgs in
+        pkgs
+      in
+      pkgs |> Current.list_map (module OpamPackage) (fun pkg ->
+          let prefix =
+            let+ pkg = pkg in
+            OpamPackage.to_string pkg ^ status_sep ^ label
+          in
+          let base = Build.pull ~schedule:weekly spec in
+          let image =
+            Build.v ~base ~spec ~revdep:None ~with_tests:false ~pkg ~master source in
+          let tests =
+            let build =
+              let pkg = pkg |> Current.gate ~on:(Current.ignore_value image) in
+              Build.v ~base ~spec ~revdep:None ~with_tests:true ~pkg ~master source
             in
-            let revdeps =
-              once_done revdeps_job @@ fun revdeps ->
-              Stage (
-                String.split_on_char '\n' revdeps |>
-                List.filter (fun pkg -> not (String.equal pkg "")) |>
-                List.map (fun revdep ->
-                  let prefix = prefix^status_sep^revdep in
-                  let revdep = Some revdep in
-                  let image = Build.v ~spec ~schedule:weekly ~revdep ~with_tests:false ~pkg ~master source in
-                  let tests =
-                    once_done image @@ fun _ ->
-                    Job (prefix^status_sep^"tests", job_id (Build.v ~spec ~schedule:weekly ~revdep ~with_tests:true ~pkg ~master source))
-                  in
-                  Stage [Job (prefix, job_id image); Dynamic tests]
-                )
-              )
+            let+ prefix = prefix
+            and+ job_id = job_id build
+            and+ result = const `Built build
             in
-            Stage [Job (prefix, job_id revdeps_job); Dynamic revdeps]
-          else
-            Current.return Skip
-        in
-        Stage [Job (prefix, job_id image); Dynamic tests; Dynamic revdeps]
-      ) pkgs
+            [job ~label:(prefix^status_sep^"tests") ~job_id result]
+          in
+          let revdeps =
+            if revdeps then
+              let prefix = Current.map (fun prefix -> prefix^status_sep^"revdeps") prefix in
+              let revdeps_job =
+                list_revdeps ~builder ~image ~pkg
+              in
+              let revdeps =
+                revdeps_job |>
+                Current.list_map (module OpamPackage) (fun revdep ->
+                    let prefix =
+                      let+ prefix = prefix
+                      and+ revdep = revdep in
+                      prefix ^ status_sep ^ OpamPackage.to_string revdep
+                    in
+                    let revdep = Some revdep in
+                    let image = Build.v ~base ~spec ~revdep ~with_tests:false ~pkg ~master source in
+                    let tests =
+                      let build = Build.v ~base ~spec ~revdep ~with_tests:true ~pkg ~master source in
+                      let+ prefix = prefix
+                      and+ job_id = job_id build
+                      and+ result = const `Built build
+                      in
+                      [job ~label:(prefix^status_sep^"tests") ~job_id result]
+                    in
+                    let+ prefix = prefix
+                    and+ tests = tests |> until_ok []
+                    and+ job_id = job_id image
+                    and+ result = const `Built image
+                    in
+                    job ~label:prefix  ~job_id result :: tests
+                  )
+                |> Current.map List.concat
+              in
+              let+ prefix = prefix
+              and+ revdeps = revdeps |> until_ok []
+              and+ job_id = job_id revdeps_job
+              and+ result = const `Checked revdeps_job
+              in
+              job ~label:prefix ~job_id result :: revdeps
+            else
+              Current.return []
+          in
+          let+ prefix = prefix
+          and+ revdeps = revdeps |> until_ok []
+          and+ tests = tests |> until_ok []
+          and+ job_id = job_id image    (* Again?? *)
+          and+ result = const `Built image
+          in
+          job ~label:prefix ~job_id result :: tests @ revdeps
+        )
+      |> Current.map List.concat
     in
     let stages =
-      List.concat [
+      Current.list_seq [
         (* Compilers *)
         build ~revdeps:true "4.11" Conf.Builder.amd1 "debian-10-ocaml-4.11";
         build ~revdeps:true "4.10" Conf.Builder.amd1 "debian-10-ocaml-4.10";
@@ -135,13 +204,15 @@ let build_with_docker ~analysis ~master source =
         (* Extra checks *)
         build ~revdeps:false ("extras"^status_sep^"flambda") Conf.Builder.amd1 ("debian-10-ocaml-"^default_compiler^"-flambda");
       ]
+      |> Current.map List.concat
     in
-    Stage stages
+    stages
   in
-  Stage [
-    Job ("(analysis)", job_id ~kind:`Checked analysis) ;
-    Dynamic pipeline;
-  ]
+  let+ pipeline = pipeline |> until_ok []
+  and+ job_id = job_id analysis
+  and+ result = const `Checked analysis
+  in
+  job ~label:"(analysis)" ~job_id result :: pipeline
 
 let list_errors ~ok errs =
   let groups =  (* Group by error message *)
@@ -162,21 +233,16 @@ let list_errors ~ok errs =
         Fmt.strf "%a failed" Fmt.(list ~sep:(unit ", ") pp_label) errs
     ))
 
-let summarise results =
+let summarise (results : job list) =
   results
-  |> List.map (fun (label, build) ->
-    let+ result = Current.state build ~hidden:true in
-    (label, result)
-  )
-  |> Current.list_seq
-  |> Current.map @@ fun results ->
-  results |> List.fold_left (fun (ok, pending, err, skip) -> function
-    | _, Ok `Checked -> (ok, pending, err, skip)  (* Don't count lint checks *)
-    | _, Ok `Built -> (ok + 1, pending, err, skip)
-    | l, Error `Msg m when Astring.String.is_prefix ~affix:"[SKIP]" m -> (ok, pending, err, (m, l) :: skip)
-    | l, Error `Msg m -> (ok, pending, (m, l) :: err, skip)
-    | _, Error `Active _ -> (ok, pending + 1, err, skip)
-  ) (0, 0, [], [])
+  |> List.map (fun (label, (result, _id)) -> (label, result))
+  |> List.fold_left (fun (ok, pending, err, skip) -> function
+      | _, Ok `Checked -> (ok, pending, err, skip)  (* Don't count lint checks *)
+      | _, Ok `Built -> (ok + 1, pending, err, skip)
+      | l, Error `Msg m when Astring.String.is_prefix ~affix:"[SKIP]" m -> (ok, pending, err, (m, l) :: skip)
+      | l, Error `Msg m -> (ok, pending, (m, l) :: err, skip)
+      | _, Error `Active _ -> (ok, pending + 1, err, skip)
+    ) (0, 0, [], [])
   |> fun (ok, pending, err, skip) ->
   if pending > 0 then Error (`Active `Running)
   else match ok, err, skip with
@@ -198,34 +264,17 @@ let get_prs repo =
   in
   let prs =
     let+ refs = refs in
-  Github.Api.Ref_map.fold begin fun key head acc ->
-    match key with
-    | `Ref _ -> acc (* Skip branches, only check PRs *)
-    | `PR _ -> head :: acc
-  end refs []
+    Github.Api.Ref_map.fold begin fun key head acc ->
+      match key with
+      | `Ref _ -> acc (* Skip branches, only check PRs *)
+      | `PR _ -> head :: acc
+    end refs []
   in
   master, prs
 
-let rec get_jobs_aux f = function
-  | Skip -> Current.return []
-  | Job job -> Current.map (fun job -> [job]) (f job)
-  | Dynamic pipeline -> Current.bind (get_jobs_aux f) pipeline
-  | Stage stages ->
-      List.fold_left (fun acc stage ->
-        let+ stage = get_jobs_aux f stage
-        and+ acc = acc in
-        stage @ acc
-      ) (Current.return []) stages
-
-let summarise builds =
-  let get_job (variant, (build, _job)) = Current.return (variant, build) in
-  Current.component "summarise" |>
-  let** jobs = get_jobs_aux get_job builds in
-  summarise jobs
-
-let get_jobs builds =
-  let get_job (variant, (_build, job)) = Current.map (fun job -> (variant, job)) job in
-  get_jobs_aux get_job builds
+let get_jobs (builds : job list) =
+  let get_job (variant, (_build, job)) = (variant, job) in
+  List.map get_job builds
 
 let local_test repo () =
   let src = Git.Local.head_commit repo in
@@ -234,7 +283,7 @@ let local_test repo () =
   Current.component "summarise" |>
   let** result =
     build_with_docker ~analysis ~master src |>
-    summarise
+    Current.map summarise
   in
   Current.of_output result
 
@@ -248,7 +297,7 @@ let v ~app () =
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
   let analysis = Analyse.examine ~master src in
   let builds = build_with_docker ~analysis ~master src in
-  let summary = summarise builds in
+  let summary = Current.map summarise builds in
   let status =
     let+ summary = summary in
     match summary with
@@ -258,7 +307,7 @@ let v ~app () =
   in
   let index =
     let+ commit = head
-    and+ jobs = get_jobs builds
+    and+ jobs = Current.map get_jobs builds
     and+ status = status in
     let repo = Current_github.Api.Commit.repo_id commit in
     let hash = Current_github.Api.Commit.hash commit in
