@@ -39,23 +39,55 @@ let set_active_refs ~repo xs =
 
 let status_sep = String.make 1 Common.status_sep
 
-type job = (string * ([`Built | `Checked] Current_term.Output.t * Current.job_id option))
+module Node = struct
+  type t =
+    | Root of t list
+    | Branch of { label : string; children : t list }
+    | Leaf of
+        {
+          label : string;
+          job_id : Current.job_id option;
+          result : [`Built | `Checked] Current_term.Output.t;
+        }
 
-let job ~label ~job_id result : job = (label, (result, job_id))
+  let root children = Root children
+  let branch ~label children = Branch { label; children }
+  let leaf ~label ~job_id result = Leaf { label; job_id; result }
+
+  let rec flatten ?(prefix="") f = function
+    | Root children ->
+      List.concat_map (flatten ~prefix f) children
+    | Branch { label; children } ->
+      let label = prefix ^ label in
+      let prefix = label ^ status_sep in
+      List.concat_map (flatten ~prefix f) children
+    | Leaf { label; job_id; result } ->
+      let label = prefix ^ label in
+      [f ~label ~job_id ~result]
+
+  let pp_result f = function
+    | Ok `Built -> Fmt.string f "built"
+    | Ok `Checked -> Fmt.string f "checked"
+    | Error (`Active _) -> Fmt.string f "active"
+    | Error (`Msg m) -> Fmt.string f m
+
+  let rec dump f = function
+    | Root children ->
+      Fmt.pf f "@[<v>%a@]"
+        (Fmt.(list ~sep:cut) dump) children
+    | Branch { label; children } ->
+      Fmt.pf f "@[<v2>%s%a@]"
+        label
+        Fmt.(list ~sep:nop (cut ++ dump)) children
+    | Leaf { label; job_id = _; result } ->
+      Fmt.pf f "%s (%a)" label pp_result result
+end
 
 let job_id job =
   let+ md = Current.Analysis.metadata job in
   match md with
   | Some { Current.Metadata.job_id; _ } -> job_id
   | None -> None
-
-(*
-let once_done x f =
-  let+ state = Current.state ~hidden:true x in
-  match state with
-  | Error _ -> Skip
-  | Ok x -> f x
-*)
 
 module OpamPackage = struct
   include OpamPackage
@@ -90,7 +122,36 @@ let with_label l t =
   let> v = t in
   Current.Primitive.const v
 
-let build_with_docker ~analysis ~master source : job list Current.t =
+let test_revdeps ~builder ~image ~master ~base ~spec ~pkg source =
+  let revdeps_job =
+    list_revdeps ~builder ~image ~pkg
+  in
+  let revdeps =
+    revdeps_job |>
+    Current.list_map (module OpamPackage) (fun revdep ->
+        let image = Build.v ~base ~spec ~revdep ~with_tests:false ~pkg ~master source in
+        let tests =
+          let build = Build.v ~base ~spec ~revdep ~with_tests:true ~pkg ~master source in
+          let+ job_id = job_id build
+          and+ result = const `Built build
+          in
+          [Node.leaf ~label:"tests" ~job_id result]
+        in
+        let+ label = Current.map OpamPackage.to_string revdep
+        and+ tests = tests |> until_ok []
+        and+ job_id = job_id image
+        and+ result = const `Built image
+        in
+        Node.branch ~label (Node.leaf ~label:"build"  ~job_id result :: tests)
+      )
+  in
+  let+ revdeps = revdeps |> until_ok []
+  and+ job_id = job_id revdeps_job
+  and+ result = const `Checked revdeps_job
+  in
+  Node.leaf ~label:"list revdeps" ~job_id result :: revdeps
+
+let build_with_docker ~analysis ~master source =
   let pipeline =
     let pkgs = Current.map Analyse.Analysis.packages analysis in
     let build ~revdeps label builder variant =
@@ -109,79 +170,38 @@ let build_with_docker ~analysis ~master source : job list Current.t =
         pkgs
       in
       pkgs |> Current.list_map (module OpamPackage) (fun pkg ->
-          let prefix =
-            let+ pkg = pkg in
-            OpamPackage.to_string pkg ^ status_sep ^ label
-          in
           let base = Build.pull ~schedule:weekly spec in
           let image =
-            Build.v ~base ~spec ~revdep:None ~with_tests:false ~pkg ~master source in
+            Build.v ~base ~spec ~with_tests:false ~pkg ~master source in
           let tests =
             let build =
               let pkg = pkg |> Current.gate ~on:(Current.ignore_value image) in
-              Build.v ~base ~spec ~revdep:None ~with_tests:true ~pkg ~master source
+              Build.v ~base ~spec ~with_tests:true ~pkg ~master source
             in
-            let+ prefix = prefix
-            and+ job_id = job_id build
+            let+ job_id = job_id build
             and+ result = const `Built build
             in
-            [job ~label:(prefix^status_sep^"tests") ~job_id result]
+            Node.leaf ~label:"tests" ~job_id result
           in
           let revdeps =
             if revdeps then
-              let prefix = Current.map (fun prefix -> prefix^status_sep^"revdeps") prefix in
-              let revdeps_job =
-                list_revdeps ~builder ~image ~pkg
-              in
-              let revdeps =
-                revdeps_job |>
-                Current.list_map (module OpamPackage) (fun revdep ->
-                    let prefix =
-                      let+ prefix = prefix
-                      and+ revdep = revdep in
-                      prefix ^ status_sep ^ OpamPackage.to_string revdep
-                    in
-                    let revdep = Some revdep in
-                    let image = Build.v ~base ~spec ~revdep ~with_tests:false ~pkg ~master source in
-                    let tests =
-                      let build = Build.v ~base ~spec ~revdep ~with_tests:true ~pkg ~master source in
-                      let+ prefix = prefix
-                      and+ job_id = job_id build
-                      and+ result = const `Built build
-                      in
-                      [job ~label:(prefix^status_sep^"tests") ~job_id result]
-                    in
-                    let+ prefix = prefix
-                    and+ tests = tests |> until_ok []
-                    and+ job_id = job_id image
-                    and+ result = const `Built image
-                    in
-                    job ~label:prefix  ~job_id result :: tests
-                  )
-                |> Current.map List.concat
-              in
-              let+ prefix = prefix
-              and+ revdeps = revdeps |> until_ok []
-              and+ job_id = job_id revdeps_job
-              and+ result = const `Checked revdeps_job
-              in
-              job ~label:prefix ~job_id result :: revdeps
+              test_revdeps ~builder ~image ~master ~base ~spec ~pkg source
             else
               Current.return []
           in
-          let+ prefix = prefix
+          let+ label = Current.map OpamPackage.to_string pkg
           and+ revdeps = revdeps |> until_ok []
-          and+ tests = tests |> until_ok []
-          and+ job_id = job_id image    (* Again?? *)
+          and+ tests = tests
+          and+ job_id = job_id image
           and+ result = const `Built image
           in
-          job ~label:prefix ~job_id result :: tests @ revdeps
+          let build = Node.leaf ~label:"build" ~job_id result in
+          let revdeps = Node.branch ~label:"revdeps" revdeps in
+          Node.branch ~label [build; tests; revdeps]
         )
-      |> Current.map List.concat
+      |> Current.map (fun builds -> Node.branch ~label builds)
     in
-    let stages =
-      Current.list_seq [
-        (* Compilers *)
+    let+ compilers = Current.list_seq [
         build ~revdeps:true "4.11" Conf.Builder.amd1 "debian-10-ocaml-4.11";
         build ~revdeps:true "4.10" Conf.Builder.amd1 "debian-10-ocaml-4.10";
         build ~revdeps:true "4.09" Conf.Builder.amd1 "debian-10-ocaml-4.09";
@@ -192,27 +212,32 @@ let build_with_docker ~analysis ~master source : job list Current.t =
         build ~revdeps:true "4.04" Conf.Builder.amd1 "debian-10-ocaml-4.04";
         build ~revdeps:true "4.03" Conf.Builder.amd1 "debian-10-ocaml-4.03";
         build ~revdeps:true "4.02" Conf.Builder.amd1 "debian-10-ocaml-4.02";
-        (* Distributions *)
-        build ~revdeps:false ("distributions"^status_sep^"alpine-3.11") Conf.Builder.amd1 ("alpine-3.11-ocaml-"^default_compiler);
-        build ~revdeps:false ("distributions"^status_sep^"debian-testing") Conf.Builder.amd1 ("debian-testing-ocaml-"^default_compiler);
-        build ~revdeps:false ("distributions"^status_sep^"debian-unstable") Conf.Builder.amd1 ("debian-unstable-ocaml-"^default_compiler);
-        build ~revdeps:false ("distributions"^status_sep^"centos-8") Conf.Builder.amd1 ("centos-8-ocaml-"^default_compiler);
-        build ~revdeps:false ("distributions"^status_sep^"fedora-31") Conf.Builder.amd1 ("fedora-31-ocaml-"^default_compiler);
-        build ~revdeps:false ("distributions"^status_sep^"opensuse-15.1") Conf.Builder.amd1 ("opensuse-15.1-ocaml-"^default_compiler);
-        build ~revdeps:false ("distributions"^status_sep^"ubuntu-18.04") Conf.Builder.amd1 ("ubuntu-18.04-ocaml-"^default_compiler);
-        build ~revdeps:false ("distributions"^status_sep^"ubuntu-20.04") Conf.Builder.amd1 ("ubuntu-20.04-ocaml-"^default_compiler);
-        (* Extra checks *)
-        build ~revdeps:false ("extras"^status_sep^"flambda") Conf.Builder.amd1 ("debian-10-ocaml-"^default_compiler^"-flambda");
       ]
-      |> Current.map List.concat
+    and+ distributions = Current.list_seq [
+        build ~revdeps:false "alpine-3.11" Conf.Builder.amd1 ("alpine-3.11-ocaml-"^default_compiler);
+        build ~revdeps:false "debian-testing" Conf.Builder.amd1 ("debian-testing-ocaml-"^default_compiler);
+        build ~revdeps:false "debian-unstable" Conf.Builder.amd1 ("debian-unstable-ocaml-"^default_compiler);
+        build ~revdeps:false "centos-8" Conf.Builder.amd1 ("centos-8-ocaml-"^default_compiler);
+        build ~revdeps:false "fedora-31" Conf.Builder.amd1 ("fedora-31-ocaml-"^default_compiler);
+        build ~revdeps:false "opensuse-15.1" Conf.Builder.amd1 ("opensuse-15.1-ocaml-"^default_compiler);
+        build ~revdeps:false "ubuntu-18.04" Conf.Builder.amd1 ("ubuntu-18.04-ocaml-"^default_compiler);
+        build ~revdeps:false "ubuntu-20.04" Conf.Builder.amd1 ("ubuntu-20.04-ocaml-"^default_compiler);
+      ]
+    and+ extras = Current.list_seq [
+        build ~revdeps:false "flambda" Conf.Builder.amd1 ("debian-10-ocaml-"^default_compiler^"-flambda");
+      ]
     in
-    stages
+    [
+      Node.branch ~label:"compilers" compilers;
+      Node.branch ~label:"distributions" distributions;
+      Node.branch ~label:"extras" extras;
+    ]
   in
   let+ pipeline = pipeline |> until_ok []
   and+ job_id = job_id analysis
   and+ result = const `Checked analysis
   in
-  job ~label:"(analysis)" ~job_id result :: pipeline
+  Node.root (Node.leaf ~label:"(analysis)" ~job_id result :: pipeline)
 
 let list_errors ~ok errs =
   let groups =  (* Group by error message *)
@@ -233,9 +258,9 @@ let list_errors ~ok errs =
         Fmt.strf "%a failed" Fmt.(list ~sep:(unit ", ") pp_label) errs
     ))
 
-let summarise (results : job list) =
+let summarise results =
   results
-  |> List.map (fun (label, (result, _id)) -> (label, result))
+  |> Node.flatten (fun ~label ~job_id:_ ~result -> (label, result))
   |> List.fold_left (fun (ok, pending, err, skip) -> function
       | _, Ok `Checked -> (ok, pending, err, skip)  (* Don't count lint checks *)
       | _, Ok `Built -> (ok + 1, pending, err, skip)
@@ -272,18 +297,15 @@ let get_prs repo =
   in
   master, prs
 
-let get_jobs (builds : job list) =
-  let get_job (variant, (_build, job)) = (variant, job) in
-  List.map get_job builds
-
 let local_test repo () =
   let src = Git.Local.head_commit repo in
   let master = Git.Local.commit_of_ref repo "refs/heads/master" in
   let analysis = Analyse.examine ~master src in
   Current.component "summarise" |>
   let** result =
-    build_with_docker ~analysis ~master src |>
-    Current.map summarise
+    build_with_docker ~analysis ~master src
+    |> Current.map (fun x -> Fmt.pr "%a@." Node.dump x; x)
+    |> Current.map summarise
   in
   Current.of_output result
 
@@ -307,7 +329,7 @@ let v ~app () =
   in
   let index =
     let+ commit = head
-    and+ jobs = Current.map get_jobs builds
+    and+ jobs = Current.map (Node.flatten (fun ~label ~job_id ~result:_ -> (label, job_id))) builds
     and+ status = status in
     let repo = Current_github.Api.Commit.repo_id commit in
     let hash = Current_github.Api.Commit.hash commit in

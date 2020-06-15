@@ -27,7 +27,7 @@ val pull :
 val v :
   spec:Spec.t Current.t ->
   base:Current_docker.Raw.Image.t Current.t ->
-  revdep:OpamPackage.t Current.t option ->
+  ?revdep:OpamPackage.t Current.t ->
   with_tests:bool ->
   pkg:OpamPackage.t Current.t ->
   master:Current_git.Commit.t Current.t ->

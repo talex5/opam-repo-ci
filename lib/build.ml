@@ -146,7 +146,7 @@ let pread ~spec image ~args =
   let> { Spec.platform = {Platform.builder; _}; _ } = spec in
   Builder.pread builder ~args image
 
-let v ~spec ~base ~revdep ~with_tests ~pkg ~master commit =
+let v ~spec ~base ?revdep ~with_tests ~pkg ~master commit =
   Current.component (if with_tests then "test" else "build") |>
   let> { Spec.platform; ty; label } = spec
   and> base = base
